@@ -7,13 +7,17 @@ from datetime import datetime
 from datetime import timedelta
 
 import ask_sdk_core.utils as ask_utils
-from ask_sdk_core.utils import is_intent_name
+from ask_sdk_core.api_client import DefaultApiClient
 from ask_sdk_core.skill_builder import CustomSkillBuilder
 from ask_sdk_core.dispatch_components import AbstractRequestHandler
 from ask_sdk_core.dispatch_components import AbstractExceptionHandler
 from ask_sdk_core.handler_input import HandlerInput
 from ask_sdk_model import Response
 from ask_sdk_model.canfulfill import CanFulfillIntent, CanFulfillIntentValues
+from ask_sdk_model.interfaces.connections import SendRequestDirective
+from ask_sdk_model.services import ServiceException
+from ask_sdk_model.services.reminder_management import Trigger, TriggerType, SpokenText, AlertInfo, SpokenInfo, \
+    PushNotification, ReminderRequest, PushNotificationStatus
 from ask_sdk_model.ui import SimpleCard
 from ask_sdk_s3.adapter import S3Adapter
 
@@ -48,14 +52,17 @@ class SinoAliceQuery:
             return hours_string + str(minutes) + " " + plural_minute
 
     @staticmethod
-    def next_event_time_in_minutes(delta_array):
+    def next_event_time_in_minutes(delta_array, include_current_event):
+        min_time = 0
+        if include_current_event:
+            min_time = -30
         next_event = 9999999999999
         for event in delta_array:
             utc_time = datetime.combine(datetime.utcnow(), datetime.min.time()) + event
             diff = utc_time - datetime.utcnow()
             min_until = diff.total_seconds() / 60
             # An event goes for 30 min, if it's less than 0, this means an event is happening now
-            if -30 < min_until < next_event:
+            if min_time < min_until < next_event:
                 next_event = min_until
         return next_event
 
@@ -73,7 +80,7 @@ class SinoAliceQuery:
             timedelta(days=1, minutes=30)
         ]
 
-        next_event = SinoAliceQuery.next_event_time_in_minutes(upgrade_times)
+        next_event = SinoAliceQuery.next_event_time_in_minutes(upgrade_times, True)
         if next_event > 0:
             return "The next weapon and armor upgrade event is in " + \
                    SinoAliceQuery.generate_english_time(timedelta(minutes=next_event)) + "."
@@ -94,7 +101,7 @@ class SinoAliceQuery:
             timedelta(days=1, hours=1, minutes=30)
         ]
 
-        next_event = SinoAliceQuery.next_event_time_in_minutes(upgrade_times)
+        next_event = SinoAliceQuery.next_event_time_in_minutes(upgrade_times, True)
         if next_event > 0:
             return "The next conquest event is in " + \
                    SinoAliceQuery.generate_english_time(timedelta(minutes=next_event)) + "."
@@ -165,6 +172,72 @@ class ConquestTimeIntentHandler(AbstractRequestHandler):
                          .speak(speak_output)
                          .response
         )
+
+
+class SetUpgradeTimerIntentHandler(AbstractRequestHandler):
+    """Handler for Set Upgrade Timer Intent."""
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("SetUpgradeTimerIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        rb = handler_input.response_builder
+        request_envelope = handler_input.request_envelope
+        permissions = request_envelope.context.system.user.permissions
+
+        if not (permissions and permissions.consent_token):
+            return (
+                rb.add_directive(
+                    SendRequestDirective(
+                        name="AskFor",
+                        payload={
+                            "@type": "AskForPermissionsConsentRequest",
+                            "@version": "1",
+                            "permissionScope": "alexa::alerts:reminders:skill:readwrite",
+                        },
+                        token=""
+                    )
+                ).response
+            )
+
+        reminder_service = handler_input.service_client_factory.get_reminder_management_service()
+
+        upgrade_times = [
+            timedelta(hours=0, minutes=30),
+            timedelta(hours=2, minutes=30),
+            timedelta(hours=11, minutes=30),
+            timedelta(hours=18, minutes=30),
+            timedelta(hours=20, minutes=30),
+            timedelta(hours=22, minutes=30),
+            timedelta(days=1, minutes=30)
+        ]
+        next_event = SinoAliceQuery.next_event_time_in_minutes(upgrade_times, False) - 1
+        reminder_time = datetime.utcnow() + timedelta(minutes=next_event)
+        notification_time = reminder_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        trigger = Trigger(TriggerType.SCHEDULED_ABSOLUTE, notification_time, time_zone_id="Etc/UTC")
+        text = SpokenText(locale='en-US',
+                          ssml='<speak>The next weapon and armor upgrade event is about to begin!</speak>',
+                          text='The next weapon and armor upgrade event is about to begin!')
+        alert_info = AlertInfo(SpokenInfo([text]))
+        push_notification = PushNotification(PushNotificationStatus.ENABLED)
+        reminder_request = ReminderRequest(notification_time, trigger, alert_info, push_notification)
+
+        try:
+            reminder_response = reminder_service.create_reminder(reminder_request)
+        except ServiceException as e:
+            # see: https://developer.amazon.com/docs/smapi/alexa-reminders-api-reference.html#error-messages
+            logger.error(e)
+            raise e
+
+        reminder_set_text = "Okay. I'll remind you in " + \
+                            SinoAliceQuery.generate_english_time(timedelta(minutes=next_event)) + "."
+
+        return rb.speak(reminder_set_text) \
+            .set_card(SimpleCard("Weapon / Armor Event Reminder", reminder_set_text)) \
+            .set_should_end_session(True) \
+            .response
 
 
 class HelpIntentHandler(AbstractRequestHandler):
@@ -307,14 +380,14 @@ logger.setLevel(logging.INFO)
 # The SkillBuilder object acts as the entry point for your skill, routing all request and response
 # payloads to the handlers above. Make sure any new handlers or interceptors you've
 # defined are included below. The order matters - they're processed top to bottom.
-sb = CustomSkillBuilder(persistence_adapter=s3_adapter)
+sb = CustomSkillBuilder(persistence_adapter=s3_adapter, api_client=DefaultApiClient())
 
 sb.add_request_handler(CanFulfillIntentRequestHandler())
 
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(UpgradeTimeIntentHandler())
 sb.add_request_handler(ConquestTimeIntentHandler())
-
+sb.add_request_handler(SetUpgradeTimerIntentHandler())
 
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(CancelOrStopIntentHandler())
