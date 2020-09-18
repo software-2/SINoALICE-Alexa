@@ -1,0 +1,1 @@
+Because I'm too lazy to use one of a dozen web-based timers already out there.
