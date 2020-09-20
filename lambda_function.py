@@ -240,6 +240,72 @@ class SetUpgradeTimerIntentHandler(AbstractRequestHandler):
             .response
 
 
+class SetConquestTimerIntentHandler(AbstractRequestHandler):
+    """Handler for Set Conquest Timer Intent."""
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("SetConquestTimerIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        rb = handler_input.response_builder
+        request_envelope = handler_input.request_envelope
+        permissions = request_envelope.context.system.user.permissions
+
+        if not (permissions and permissions.consent_token):
+            return (
+                rb.add_directive(
+                    SendRequestDirective(
+                        name="AskFor",
+                        payload={
+                            "@type": "AskForPermissionsConsentRequest",
+                            "@version": "1",
+                            "permissionScope": "alexa::alerts:reminders:skill:readwrite",
+                        },
+                        token=""
+                    )
+                ).response
+            )
+
+        reminder_service = handler_input.service_client_factory.get_reminder_management_service()
+
+        upgrade_times = [
+            timedelta(hours=1, minutes=30),
+            timedelta(hours=3, minutes=30),
+            timedelta(hours=12, minutes=0),
+            timedelta(hours=19, minutes=30),
+            timedelta(hours=21, minutes=30),
+            timedelta(hours=23, minutes=30),
+            timedelta(days=1, hours=1, minutes=30)
+        ]
+        next_event = SinoAliceQuery.next_event_time_in_minutes(upgrade_times, False) - 1
+        reminder_time = datetime.utcnow() + timedelta(minutes=next_event)
+        notification_time = reminder_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        trigger = Trigger(TriggerType.SCHEDULED_ABSOLUTE, notification_time, time_zone_id="Etc/UTC")
+        text = SpokenText(locale='en-US',
+                          ssml='<speak>The next conquest event is about to begin!</speak>',
+                          text='The next conquest event is about to begin!')
+        alert_info = AlertInfo(SpokenInfo([text]))
+        push_notification = PushNotification(PushNotificationStatus.ENABLED)
+        reminder_request = ReminderRequest(notification_time, trigger, alert_info, push_notification)
+
+        try:
+            reminder_response = reminder_service.create_reminder(reminder_request)
+        except ServiceException as e:
+            # see: https://developer.amazon.com/docs/smapi/alexa-reminders-api-reference.html#error-messages
+            logger.error(e)
+            raise e
+
+        reminder_set_text = "Okay. I'll remind you in " + \
+                            SinoAliceQuery.generate_english_time(timedelta(minutes=next_event)) + "."
+
+        return rb.speak(reminder_set_text) \
+            .set_card(SimpleCard("Conquest Event Reminder", reminder_set_text)) \
+            .set_should_end_session(True) \
+            .response
+
+
 class HelpIntentHandler(AbstractRequestHandler):
     """Handler for Help Intent."""
     def can_handle(self, handler_input):
@@ -388,6 +454,7 @@ sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(UpgradeTimeIntentHandler())
 sb.add_request_handler(ConquestTimeIntentHandler())
 sb.add_request_handler(SetUpgradeTimerIntentHandler())
+sb.add_request_handler(SetConquestTimerIntentHandler())
 
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(CancelOrStopIntentHandler())
